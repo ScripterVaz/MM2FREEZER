@@ -1,0 +1,390 @@
+-- Optimized Premium Squarish Loading UI (Executor-friendly)
+-- Safe client-side visual removed (only the small "CLIENT-SIDE VISUAL" label removed)
+-- + Full input lock while UI is active
+-- Fixes: progress now updates correctly (no longer stays at 0%), blur set to 45
+-- Optimizations:
+-- * minimal tweens during main loop (direct updates on Heartbeat)
+-- * single Heartbeat loop for percent + status + dot animation
+-- * Aura pulse & modal pop use TweenService (few tweens only)
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local ContextActionService = game:GetService("ContextActionService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+if not player then return end
+local PlayerGui = player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui")
+
+-- === CONFIG ===
+local GUI_NAME = "Mm2LoadingUI_Optimized"
+local TOTAL_TIME = 300 -- seconds (5 minutes)
+local TICK = 0.08 -- heartbeat tick
+local BLUR_TARGET = 45 -- changed to 45 (stronger blur)
+local MODAL_W = 0.48
+local MODAL_H = 0.24
+local DOT_INTERVAL = 0.44
+local INPUT_ACTION = "Mm2_LockAllInputs"
+-- ==============
+
+-- cleanup previous
+local old = PlayerGui:FindFirstChild(GUI_NAME)
+if old then old:Destroy() end
+local oldBlur = Lighting:FindFirstChild(GUI_NAME .. "_Blur")
+if oldBlur then oldBlur:Destroy() end
+
+-- client-only blur
+local blur = Instance.new("BlurEffect")
+blur.Name = GUI_NAME .. "_Blur"
+blur.Size = 0
+blur.Parent = Lighting
+
+-- ScreenGui
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = GUI_NAME
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.Parent = PlayerGui
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+-- === INPUT LOCK SETUP ===
+-- Build a big list of inputs to sink: all KeyCodes + all UserInputTypes
+local blockInputs = {}
+for _, v in ipairs(Enum.KeyCode:GetEnumItems()) do
+table.insert(blockInputs, v)
+end
+for _, v in ipairs(Enum.UserInputType:GetEnumItems()) do
+table.insert(blockInputs, v)
+end
+
+-- store previous states so we can restore later
+local prevCameraType = nil
+local prevPlatformStand = nil
+local humanoid = nil
+local char = player.Character
+if not char then
+local ok, c = pcall(function() return player.Character end)
+char = ok and c or nil
+end
+if char then
+humanoid = char:FindFirstChildOfClass("Humanoid")
+end
+-- safe store and apply freeze
+if humanoid then
+prevPlatformStand = humanoid.PlatformStand
+pcall(function() humanoid.PlatformStand = true end)
+end
+if workspace.CurrentCamera then
+prevCameraType = workspace.CurrentCamera.CameraType
+pcall(function() workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable end)
+end
+
+-- Bind sink action at highest priority (safe pcall)
+pcall(function()
+ContextActionService:BindActionAtPriority(
+INPUT_ACTION,
+function() return Enum.ContextActionResult.Sink end,
+false,
+Enum.ContextActionPriority.Highest.Value,
+table.unpack(blockInputs)
+)
+end)
+
+-- Big cinematic title container
+local bigTitleContainer = Instance.new("Frame")
+bigTitleContainer.Name = "BigTitleContainer"
+bigTitleContainer.Size = UDim2.new(1, 0, 0.18, 0)
+bigTitleContainer.Position = UDim2.new(0, 0, 0.06, 0)
+bigTitleContainer.BackgroundTransparency = 1
+bigTitleContainer.Parent = screenGui
+
+local bigTitle = Instance.new("TextLabel")
+bigTitle.Name = "BigTitle"
+bigTitle.AnchorPoint = Vector2.new(0, 0.5)
+bigTitle.Size = UDim2.new(0.9, 0, 0.9, 0)
+bigTitle.Position = UDim2.new(-1.25, 0, 0.5, 0)
+bigTitle.BackgroundTransparency = 1
+bigTitle.Text = "MM2 LOADING"
+bigTitle.Font = Enum.Font.GothamBlack
+bigTitle.TextSize = 72
+bigTitle.TextColor3 = Color3.fromRGB(255,255,255)
+bigTitle.TextStrokeTransparency = 0.7
+bigTitle.TextWrapped = false
+bigTitle.Parent = bigTitleContainer
+
+local bigSub = Instance.new("TextLabel")
+bigSub.Name = "BigSub"
+bigSub.Size = UDim2.new(0.5, 0, 0.2, 0)
+bigSub.Position = UDim2.new(0.02, 0, 0.78, 0)
+bigSub.BackgroundTransparency = 1
+bigSub.Text = "Visual loading overlay"
+bigSub.Font = Enum.Font.Gotham
+bigSub.TextSize = 16
+bigSub.TextColor3 = Color3.fromRGB(200,200,200)
+bigSub.TextTransparency = 0.3
+bigSub.Parent = bigTitleContainer
+
+-- Squarish modal (starts slightly above and hidden)
+local modal = Instance.new("Frame")
+modal.Name = "Modal"
+modal.Size = UDim2.new(MODAL_W, 0, MODAL_H, 0)
+modal.AnchorPoint = Vector2.new(0.5, 0.5)
+modal.Position = UDim2.new(0.5, 0, 0.45, 0) -- slightly above center initially
+modal.BackgroundColor3 = Color3.fromRGB(18,18,18)
+modal.BorderSizePixel = 0
+modal.Parent = screenGui
+
+-- small corner radius (squarish)
+local modalCorner = Instance.new("UICorner")
+modalCorner.CornerRadius = UDim.new(0, 6)
+modalCorner.Parent = modal
+
+-- Purple aura stroke
+local aura = Instance.new("UIStroke")
+aura.Parent = modal
+aura.Thickness = 2
+aura.Color = Color3.fromRGB(160, 40, 255)
+aura.Transparency = 0.6
+aura.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+local modalStroke = Instance.new("UIStroke")
+modalStroke.Color = Color3.fromRGB(45,45,45)
+modalStroke.Thickness = 1
+modalStroke.Parent = modal
+
+-- Modal contents (start hidden by text transparency)
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.Size = UDim2.new(1, -28, 0, 32)
+title.Position = UDim2.new(0, 14, 0, 12)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(235,235,235)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 17
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "MM2 Loading"
+title.TextTransparency = 1
+title.Parent = modal
+
+local sub = Instance.new("TextLabel")
+sub.Name = "Subtitle"
+sub.Size = UDim2.new(1, -28, 0, 18)
+sub.Position = UDim2.new(0, 14, 0, 44)
+sub.BackgroundTransparency = 1
+sub.TextColor3 = Color3.fromRGB(170,170,170)
+sub.Font = Enum.Font.Gotham
+sub.TextSize = 13
+sub.TextXAlignment = Enum.TextXAlignment.Left
+sub.Text = "Please wait — preparing assets"
+sub.TextTransparency = 1
+sub.Parent = modal
+
+-- Status label: centered horizontally, slightly above bar
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "Status"
+statusLabel.Size = UDim2.new(0.9, 0, 0, 24)
+statusLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+statusLabel.Position = UDim2.new(0.5, 0, 0.58, 0) -- nicely centered
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.fromRGB(220,220,220)
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 14
+statusLabel.TextWrapped = true
+statusLabel.Text = "Loading"
+statusLabel.TextTransparency = 1
+statusLabel.Parent = modal
+
+-- Progress bar background (lower area)
+local barBg = Instance.new("Frame")
+barBg.Name = "BarBg"
+barBg.Size = UDim2.new(0.92, 0, 0, 12)
+barBg.Position = UDim2.new(0.04, 0, 0.72, 0)
+barBg.BackgroundColor3 = Color3.fromRGB(34,34,34)
+barBg.BorderSizePixel = 0
+barBg.Parent = modal
+local bgCorner = Instance.new("UICorner"); bgCorner.CornerRadius = UDim.new(0,6); bgCorner.Parent = barBg
+
+local bar = Instance.new("Frame")
+bar.Name = "Bar"
+bar.Size = UDim2.new(0, 0, 1, 0)
+bar.Position = UDim2.new(0, 0, 0, 0)
+bar.BackgroundColor3 = Color3.fromRGB(160, 40, 255)
+bar.BorderSizePixel = 0
+bar.Parent = barBg
+local barCorner = Instance.new("UICorner"); barCorner.CornerRadius = UDim.new(0,6); barCorner.Parent = bar
+local barStroke = Instance.new("UIStroke"); barStroke.Thickness = 1; barStroke.Transparency = 0.5; barStroke.Parent = bar
+
+-- Percent label: anchored to right edge (inside modal)
+local percentLabel = Instance.new("TextLabel")
+percentLabel.Name = "Percent"
+percentLabel.Size = UDim2.new(0.18, 0, 0, 20)
+percentLabel.AnchorPoint = Vector2.new(1, 0.5)
+percentLabel.Position = UDim2.new(0.96, 0, 0.72, 0)
+percentLabel.BackgroundTransparency = 1
+percentLabel.TextColor3 = Color3.fromRGB(220,220,220)
+percentLabel.Font = Enum.Font.GothamBold
+percentLabel.TextSize = 14
+percentLabel.Text = "0%"
+percentLabel.TextTransparency = 1
+percentLabel.Parent = modal
+
+-- statuses (harmless)
+local statuses = {
+"Loading assets",
+"Establishing connection",
+"Preparing UI",
+"Caching modules",
+"Syncing local data",
+"Applying settings",
+"Finalizing"
+}
+
+-- helper: safe tween
+local function safeTween(inst, props, time, style, dir)
+style = style or Enum.EasingStyle.Quad
+dir = dir or Enum.EasingDirection.Out
+local ok, tr = pcall(function()
+local tw = TweenService:Create(inst, TweenInfo.new(time, style, dir), props)
+tw:Play()
+return tw
+end)
+return ok and tr or nil
+end
+
+-- quick blur in & modal aura pulse setup (few tweens only)
+safeTween(blur, {Size = BLUR_TARGET}, 0.34, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+-- aura pulse (tween back and forth)
+spawn(function()
+while modal.Parent and aura.Parent do
+safeTween(aura, {Transparency = 0.22}, 0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+wait(0.9)
+safeTween(aura, {Transparency = 0.62}, 0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+wait(0.9)
+end
+end)
+
+-- cinematic big title sweep
+local function playBigTitleSweep()
+bigTitle.Position = UDim2.new(-1.25, 0, 0.5, 0)
+bigTitle.TextTransparency = 0
+safeTween(bigTitle, {Position = UDim2.new(0.08, 0, 0.5, 0)}, 0.84, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+wait(0.84)
+safeTween(bigTitle, {Position = UDim2.new(1.18, 0, 0.5, 0), TextTransparency = 1}, 0.9, Enum.EasingStyle.Quart, Enum.EasingDirection.In)
+wait(0.9)
+safeTween(bigSub, {TextTransparency = 1}, 0.36)
+end
+
+-- modal pop-in: fast, elegant
+local function popModal()
+modal.BackgroundTransparency = 1
+modal.Rotation = -8
+modal.Position = UDim2.new(0.5, 0, 0.45, 0)
+-- text already at transparency 1; bar zero
+bar.Size = UDim2.new(0,0,1,0)
+
+-- pop to center quickly
+safeTween(modal, {Position = UDim2.new(0.5,0,0.5,0), BackgroundTransparency = 0, Rotation = 0}, 0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+wait(0.12)
+-- fade in text quickly (single tween per label for efficiency)
+safeTween(title, {TextTransparency = 0}, 0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+safeTween(sub, {TextTransparency = 0}, 0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+safeTween(statusLabel, {TextTransparency = 0}, 0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+safeTween(percentLabel, {TextTransparency = 0}, 0.24, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+-- small label was intentionally removed
+end
+
+-- build normalized speed factors (one-time) - still used for variance but not for percent baseline
+local function buildSpeedFactors(steps)
+local arr, total = {}, 0
+math.randomseed(tick() * 1000 + os.time() % 1000)
+for i = 1, steps do
+local v = math.random() * 2.1 + 0.35
+arr[i] = v
+total = total + v
+end
+for i = 1, steps do arr[i] = arr[i] / total end
+return arr
+end
+
+-- main runner (single Heartbeat loop)
+spawn(function()
+-- 1) title sweep
+playBigTitleSweep()
+
+-- 2) pop modal
+popModal()
+
+-- 3) prepare progress
+local steps = math.max(2, math.floor(TOTAL_TIME / TICK))
+local speed = buildSpeedFactors(steps) -- kept for color/feel variance
+local percent = 0
+local statusIndex = 1
+local statusInterval = math.max(1, math.floor(steps / #statuses))
+
+-- dot animation state
+local dotIndex = 1
+local dotTimer = 0
+
+-- time accumulator for heartbeat-based loop
+for i = 1, steps do
+-- update base status occasionally
+if i % statusInterval == 0 then
+statusIndex = (statusIndex % #statuses) + 1
+end
+local base = statuses[statusIndex]
+
+-- **Fixed percent calculation**: use linear progress based on loop iteration
+percent = math.clamp(i / steps, 0, 1)
+
+-- direct update bar size (efficient)
+bar.Size = UDim2.new(percent, 0, 1, 0)
+percentLabel.Text = string.format("%d%%", math.floor(percent * 100 + 0.5))
+
+-- update dot animation based on accumulator
+dotTimer = dotTimer + TICK
+if dotTimer >= DOT_INTERVAL then
+dotTimer = dotTimer - DOT_INTERVAL
+dotIndex = dotIndex % 4 + 1
+end
+local dots = ({ "", ".", "..", "..." })[dotIndex]
+statusLabel.Text = base .. dots
+
+-- gentle color variance to feel alive every few steps
+if i % math.max(2, math.floor(statusInterval/3)) == 0 then
+local g = 110 + math.random(0, 95)
+bar.BackgroundColor3 = Color3.fromRGB(160, math.clamp(g, 0, 255), 255)
+end
+
+-- heartbeat wait for consistent timing
+local t0 = tick()
+while tick() - t0 < TICK do RunService.Heartbeat:Wait() end
+end
+
+-- finalize cleanly
+bar.Size = UDim2.new(1, 0, 1, 0)
+percentLabel.Text = "100%"
+statusLabel.Text = "Done..."
+
+wait(0.6)
+safeTween(modal, {BackgroundTransparency = 1, Rotation = 6}, 0.36, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+safeTween(blur, {Size = 0}, 0.36, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+safeTween(bigTitle, {TextTransparency = 1}, 0.35)
+safeTween(bigSub, {TextTransparency = 1}, 0.35)
+
+wait(0.45)
+
+-- === RESTORE INPUTS & CLEANUP ===
+pcall(function() ContextActionService:UnbindAction(INPUT_ACTION) end)
+if humanoid and prevPlatformStand ~= nil then
+pcall(function() humanoid.PlatformStand = prevPlatformStand end)
+end
+if workspace.CurrentCamera and prevCameraType then
+pcall(function() workspace.CurrentCamera.CameraType = prevCameraType end)
+end
+
+if screenGui and screenGui.Parent then screenGui:Destroy() end
+if blur and blur.Parent then blur:Destroy() end
+end)
